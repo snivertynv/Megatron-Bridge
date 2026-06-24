@@ -43,6 +43,8 @@ class WorkloadBaseConfig:
     pipeline_model_parallel_size: int = 1
     context_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: int | None = None
+    hybrid_layer_pattern: Optional[str] = None
+    hybrid_override_pattern: Optional[str] = None
     expert_model_parallel_size: int = 1
     expert_tensor_parallel_size: int | None = None
 

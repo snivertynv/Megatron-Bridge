@@ -99,6 +99,7 @@ class MambaModelProvider(TransformerConfig, ModelProviderMixin[MCoreMambaModel])
     num_attention_heads: int = 1
     hybrid_attention_ratio: float = 0.0
     hybrid_mlp_ratio: float = 0.0
+    hybrid_layer_pattern: Optional[str] = None
     hybrid_override_pattern: Optional[str] = None
     seq_length: int = 8192
     # Mamba with no attention has no need for position embeddings, so none is default
@@ -131,6 +132,15 @@ class MambaModelProvider(TransformerConfig, ModelProviderMixin[MCoreMambaModel])
     # When resuming modelopt_state, we also change the mamba_stack_spec to use quantization-ready layers.
     restore_modelopt_state: bool = False
 
+    def finalize(self) -> None:
+        """Validate Bridge-side Mamba aliases before MCore post-init runs."""
+        if self.hybrid_layer_pattern is not None and self.hybrid_override_pattern is not None:
+            raise ValueError(
+                "hybrid_layer_pattern and hybrid_override_pattern cannot both be specified. "
+                "hybrid_override_pattern is deprecated; use hybrid_layer_pattern instead."
+            )
+        super().finalize()
+
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> MCoreMambaModel:
         """Configure and instantiate a Megatron Core Mamba model based on this configuration.
 
@@ -142,20 +152,24 @@ class MambaModelProvider(TransformerConfig, ModelProviderMixin[MCoreMambaModel])
         Returns:
             MCoreMambaModel: Configured Megatron Core Mamba model instance
         """
+        import inspect
+
         mamba_stack_spec = self.mamba_stack_spec
         if not isinstance(mamba_stack_spec, ModuleSpec):
             # Check if the function accepts config parameter
-            import inspect
-
             if len(inspect.signature(mamba_stack_spec).parameters) > 0:
                 mamba_stack_spec = mamba_stack_spec(self)
             else:
                 mamba_stack_spec = mamba_stack_spec()
 
-        assert getattr(self, "virtual_pipeline_model_parallel_size", None) is None and vp_stage is None, (
-            "Virtual pipeline model parallelism is temporarily unsupported in SSM/Mamaba "
-            "models due to upstream MCore MambaModel API dependency"
-        )
+        if self.hybrid_layer_pattern is not None and self.hybrid_override_pattern is not None:
+            raise ValueError(
+                "hybrid_layer_pattern and hybrid_override_pattern cannot both be specified. "
+                "hybrid_override_pattern is deprecated; use hybrid_layer_pattern instead."
+            )
+        hybrid_layer_pattern = self.hybrid_layer_pattern
+        if hybrid_layer_pattern is None:
+            hybrid_layer_pattern = self.hybrid_override_pattern
 
         assert self.vocab_size is not None, "vocab_size must be configured before calling provide()"
         if self.should_pad_vocab:
@@ -165,22 +179,46 @@ class MambaModelProvider(TransformerConfig, ModelProviderMixin[MCoreMambaModel])
         else:
             padded_vocab_size = self.vocab_size
 
-        return MCoreMambaModel(
-            self,
-            mamba_stack_spec=mamba_stack_spec,
-            vocab_size=padded_vocab_size,
-            max_sequence_length=self.seq_length,
-            hybrid_attention_ratio=self.hybrid_attention_ratio,
-            hybrid_mlp_ratio=self.hybrid_mlp_ratio,
-            hybrid_override_pattern=self.hybrid_override_pattern,
-            fp16_lm_cross_entropy=self.fp16_lm_cross_entropy,
-            parallel_output=self.parallel_output,
-            share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
-            position_embedding_type=self.position_embedding_type,
-            rotary_percent=self.rotary_percent,
-            rotary_base=self.rotary_base,
-            seq_len_interpolation_factor=self.seq_len_interpolation_factor,
-            pre_process=pre_process or is_pp_first_stage(self._pg_collection.pp),
-            post_process=post_process or is_pp_last_stage(self._pg_collection.pp),
-            pg_collection=self._pg_collection,
+        pre_process = pre_process if pre_process is not None else is_pp_first_stage(self._pg_collection.pp)
+        post_process = post_process if post_process is not None else is_pp_last_stage(self._pg_collection.pp)
+        model_kwargs = {
+            "mamba_stack_spec": mamba_stack_spec,
+            "vocab_size": padded_vocab_size,
+            "max_sequence_length": self.seq_length,
+            "hybrid_attention_ratio": self.hybrid_attention_ratio,
+            "hybrid_mlp_ratio": self.hybrid_mlp_ratio,
+            "fp16_lm_cross_entropy": self.fp16_lm_cross_entropy,
+            "parallel_output": self.parallel_output,
+            "share_embeddings_and_output_weights": self.share_embeddings_and_output_weights,
+            "position_embedding_type": self.position_embedding_type,
+            "rotary_percent": self.rotary_percent,
+            "rotary_base": self.rotary_base,
+            "seq_len_interpolation_factor": self.seq_len_interpolation_factor,
+            "pre_process": pre_process,
+            "post_process": post_process,
+            "pg_collection": self._pg_collection,
+        }
+
+        mcore_parameters = inspect.signature(MCoreMambaModel).parameters
+        accepts_extra_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in mcore_parameters.values()
         )
+        if "hybrid_layer_pattern" in mcore_parameters or accepts_extra_kwargs:
+            model_kwargs["hybrid_layer_pattern"] = hybrid_layer_pattern
+        elif "hybrid_override_pattern" in mcore_parameters:
+            model_kwargs["hybrid_override_pattern"] = hybrid_layer_pattern
+        elif hybrid_layer_pattern is not None:
+            raise ValueError(
+                "The installed Megatron Core MambaModel does not accept hybrid_layer_pattern "
+                "or hybrid_override_pattern."
+            )
+
+        if "vp_stage" in mcore_parameters or accepts_extra_kwargs:
+            model_kwargs["vp_stage"] = vp_stage
+        elif vp_stage is not None:
+            raise ValueError(
+                "Virtual pipeline model parallelism for Mamba models requires a Megatron Core "
+                "MambaModel API that accepts vp_stage."
+            )
+
+        return MCoreMambaModel(self, **model_kwargs)

@@ -192,6 +192,21 @@ def _set_checkpoint_overrides(recipe: ConfigContainer, args: argparse.Namespace)
     return recipe
 
 
+def _set_hybrid_layer_pattern(cfg: ConfigContainer, pattern: str) -> None:
+    """Set the hybrid pattern using the current provider's supported field name."""
+    if hasattr(cfg.model, "hybrid_layer_pattern"):
+        cfg.model.hybrid_layer_pattern = pattern
+        if hasattr(cfg.model, "hybrid_override_pattern"):
+            cfg.model.hybrid_override_pattern = None
+    elif hasattr(cfg.model, "hybrid_override_pattern"):
+        cfg.model.hybrid_override_pattern = pattern
+    else:
+        raise AttributeError(
+            f"{type(cfg.model).__name__} does not expose hybrid_layer_pattern "
+            "or hybrid_override_pattern"
+        )
+
+
 def set_workload_base_configs(cfg: ConfigContainer, settings: WorkloadBaseConfig) -> ConfigContainer:
     """Set workload base configs."""
     cfg.model.tensor_model_parallel_size = settings.tensor_model_parallel_size
@@ -201,6 +216,15 @@ def set_workload_base_configs(cfg: ConfigContainer, settings: WorkloadBaseConfig
     cfg.model.expert_model_parallel_size = settings.expert_model_parallel_size
     cfg.model.expert_tensor_parallel_size = settings.expert_tensor_parallel_size
     cfg.model.sequence_parallel = settings.sequence_parallel
+    if settings.hybrid_layer_pattern is not None and settings.hybrid_override_pattern is not None:
+        raise ValueError(
+            "hybrid_layer_pattern and hybrid_override_pattern cannot both be set in WorkloadBaseConfig. "
+            "Use hybrid_layer_pattern."
+        )
+    if settings.hybrid_layer_pattern is not None:
+        _set_hybrid_layer_pattern(cfg, settings.hybrid_layer_pattern)
+    elif settings.hybrid_override_pattern is not None:
+        _set_hybrid_layer_pattern(cfg, settings.hybrid_override_pattern)
     cfg.train.global_batch_size = settings.global_batch_size
     cfg.train.micro_batch_size = settings.micro_batch_size
 
