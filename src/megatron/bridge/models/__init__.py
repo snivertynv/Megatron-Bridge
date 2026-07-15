@@ -137,6 +137,7 @@ from megatron.bridge.models.olmoe import (
     OlMoEBridge,
     OlMoEModelProvider,
 )
+from megatron.bridge.models.param3 import Param3ModelProvider
 from megatron.bridge.models.qwen3_asr import (
     Qwen3ASRBridge,
     Qwen3ASRModel,
@@ -239,6 +240,7 @@ __all__ = [
     "MiniMaxM3Bridge",
     "OlMoEBridge",
     "OlMoEModelProvider",
+    "Param3ModelProvider",
     "NemotronHBridge",
     "MambaModelProvider",
     "MimoBridge",
