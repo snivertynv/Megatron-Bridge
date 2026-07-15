@@ -4,6 +4,7 @@ from megatron.bridge.recipes.param3 import (
     PARAM3_74B_ATTENTION_PATTERN,
     PARAM3_74B_MOE_PATTERN,
     param3_74b_pretrain_32gpu_h100_bf16_config,
+    param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config,
 )
 
 
@@ -32,3 +33,15 @@ def test_param3_74b_pretrain_recipe_matches_logged_architecture() -> None:
     assert cfg.train.micro_batch_size == 1
     assert cfg.checkpoint.load is None
     assert cfg.dataset.blend is None
+
+
+def test_param3_74b_cutedsl_recipe() -> None:
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config()
+
+    assert cfg.model.cuda_graph_impl == "none"
+    assert cfg.model.cuda_graph_modules == []
+    assert cfg.model.moe_grouped_gemm is True
+    assert cfg.model.use_transformer_engine_op_fuser is True
+    assert cfg.model.moe_mlp_glu_interleave_size == 32
+    assert cfg.model.moe_token_dispatcher_type == "alltoall"
+    assert cfg.model.moe_shared_expert_overlap is True

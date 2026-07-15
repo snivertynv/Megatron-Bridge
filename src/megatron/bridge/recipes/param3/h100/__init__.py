@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from megatron.bridge.recipes.param3.h100.param3 import param3_74b_pretrain_32gpu_h100_bf16_config
+from megatron.bridge.recipes.param3.h100.param3 import (
+    param3_74b_pretrain_32gpu_h100_bf16_config,
+    param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config,
+)
 
 
-__all__ = ["param3_74b_pretrain_32gpu_h100_bf16_config"]
+__all__ = [
+    "param3_74b_pretrain_32gpu_h100_bf16_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config",
+]

@@ -176,8 +176,28 @@ def param3_74b_pretrain_32gpu_h100_bf16_config() -> ConfigContainer:
     return cfg
 
 
+def param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config() -> ConfigContainer:
+    """Return the Param3 recipe with cuTeDSL routed-expert MoE fusion.
+
+    This performance variant keeps the logged Param3 architecture and training
+    settings while enabling the Transformer Engine op fuser and its required
+    GLU interleaving. The cuTeDSL fusion applies to routed experts only; CUDA
+    graphs remain disabled.
+
+    Returns:
+        ConfigContainer configured for the optimized Param3 74B smoke run.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_config()
+
+    cfg.model.use_transformer_engine_op_fuser = True
+    cfg.model.moe_mlp_glu_interleave_size = 32
+
+    return cfg
+
+
 __all__ = [
     "PARAM3_74B_ATTENTION_PATTERN",
     "PARAM3_74B_MOE_PATTERN",
     "param3_74b_pretrain_32gpu_h100_bf16_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config",
 ]
