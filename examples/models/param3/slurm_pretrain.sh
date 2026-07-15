@@ -34,6 +34,7 @@ WORKSPACE=${WORKSPACE:-/workspace}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-}
 CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-${WORKSPACE}/results/param3_74b_${SLURM_JOB_ID}/checkpoints}
+RECIPE_NAME=${RECIPE_NAME:-param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config}
 
 if [ -z "${CONTAINER_IMAGE}" ]; then
     echo "ERROR: CONTAINER_IMAGE must point to the Param3 mHC container."
@@ -44,12 +45,13 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 export PYTHONUNBUFFERED=1
 export SLURM_UNBUFFEREDIO=1
 export FORCE_FLASHQLA_GDN=${FORCE_FLASHQLA_GDN:-1}
+export NVTE_CUTEDSL_FUSED_GROUPED_MLP=${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-1}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
 export NCCL_PXN_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export MEGATRON_BRIDGE_PATH WORKSPACE CHECKPOINT_DIR
+export MEGATRON_BRIDGE_PATH WORKSPACE CHECKPOINT_DIR RECIPE_NAME
 
 read -r -d '' INNER_SCRIPT <<'EOF' || true
 set -euo pipefail
@@ -60,7 +62,7 @@ export LOCAL_RANK=${SLURM_LOCALID}
 
 cd "${MEGATRON_BRIDGE_PATH}"
 uv run --no-sync python scripts/training/run_recipe.py \
-    --recipe param3_74b_pretrain_32gpu_h100_bf16_config \
+    --recipe "${RECIPE_NAME}" \
     --dataset llm-pretrain-mock \
     --step_func gpt_step \
     checkpoint.save="${CHECKPOINT_DIR}" \
@@ -73,5 +75,6 @@ if [ -n "${CONTAINER_MOUNTS}" ]; then
 fi
 
 echo "Launching Param3 74B on ${SLURM_NNODES} nodes / ${SLURM_NTASKS} GPUs"
-echo "Recipe uses mock data, global batch size 64, and random initialization"
+echo "Recipe: ${RECIPE_NAME}"
+echo "Run uses mock data, global batch size 64, and random initialization"
 "${SRUN_CMD[@]}" bash -lc "${INNER_SCRIPT}"
