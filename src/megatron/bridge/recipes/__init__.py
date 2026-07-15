@@ -58,6 +58,8 @@ from megatron.bridge.recipes.nemotronh import *
 from megatron.bridge.recipes.nemotronh.h100 import *
 from megatron.bridge.recipes.olmoe import *
 from megatron.bridge.recipes.olmoe.h100 import *
+from megatron.bridge.recipes.param3 import *
+from megatron.bridge.recipes.param3.h100 import *
 from megatron.bridge.recipes.qwen import *
 from megatron.bridge.recipes.qwen.h100 import *
 from megatron.bridge.recipes.qwen2_audio import *
