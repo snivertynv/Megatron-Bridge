@@ -300,6 +300,7 @@ def param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config() -> Con
 
     cfg.model.recompute_modules = ["layernorm", "moe_act", "mhc"]
     _apply_param3_perf_measurement_overrides(cfg)
+    cfg.train.train_samples = 50 * cfg.train.global_batch_size
 
     return cfg
 

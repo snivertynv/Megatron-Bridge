@@ -179,6 +179,20 @@ def slurm_executor(
     log_repo_status_cmd = "bash /opt/Megatron-Bridge/docker/common/print_sha.sh /nemo_run/configs/repo_status.json"
     custom_bash_cmds.append(log_repo_status_cmd)
 
+    compile_cache_root = perf_env.get("PERF_COMPILE_CACHE_ROOT")
+    if compile_cache_root:
+        if shlex.quote(compile_cache_root) != compile_cache_root:
+            raise ValueError("PERF_COMPILE_CACHE_ROOT must not contain shell metacharacters or whitespace")
+        rank_cache_root = f"{compile_cache_root}/rank-${{SLURM_PROCID}}"
+        custom_bash_cmds.extend(
+            [
+                f"mkdir -p {rank_cache_root}/torchinductor {rank_cache_root}/triton {rank_cache_root}/cuda",
+                f"export TORCHINDUCTOR_CACHE_DIR={rank_cache_root}/torchinductor",
+                f"export TRITON_CACHE_DIR={rank_cache_root}/triton",
+                f"export CUDA_CACHE_PATH={rank_cache_root}/cuda",
+            ]
+        )
+
     numa_divisor = 2 if gpu.lower() in ["gb200", "gb300", "vr200"] else 4
     numa_cmd = f"numactl --cpunodebind=$((SLURM_LOCALID/{numa_divisor})) --membind=$((SLURM_LOCALID/{numa_divisor}))"
     if gpu.lower() in ["b300"] and enable_pct_binding:
