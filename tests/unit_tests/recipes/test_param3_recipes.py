@@ -12,6 +12,9 @@ from megatron.bridge.perf_recipes.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config as flat_pp4_perf_config,
 )
 from megatron.bridge.perf_recipes.param3 import (
+    param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config as flat_pp4_vp2_no_recompute_perf_config,
+)
+from megatron.bridge.perf_recipes.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config as flat_pp4_vp2_perf_config,
 )
 from megatron.bridge.recipes.param3 import (
@@ -26,6 +29,7 @@ from megatron.bridge.recipes.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config,
     param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config,
     param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config,
     param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config,
 )
 
@@ -173,6 +177,20 @@ def test_param3_74b_pp4_vp2_precision_aware_perf_recipe() -> None:
         assert recipe.optimizer.overlap_param_gather_with_optimizer_step is True
         assert recipe.comm_overlap.tp_comm_overlap is False
         assert recipe.comm_overlap.overlap_param_gather_with_optimizer_step is True
+
+
+def test_param3_74b_pp4_vp2_no_recompute_precision_aware_perf_recipe() -> None:
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config()
+    flat_cfg = flat_pp4_vp2_no_recompute_perf_config()
+
+    for recipe in (cfg, flat_cfg):
+        assert recipe.model.pipeline_model_parallel_size == 4
+        assert recipe.model.virtual_pipeline_model_parallel_size == 2
+        assert recipe.model.expert_tensor_parallel_size == 1
+        assert recipe.model.recompute_granularity is None
+        assert recipe.model.recompute_modules == []
+        assert recipe.model.moe_grouped_gemm is True
+        assert recipe.train.global_batch_size == 64
 
 
 def test_param3_74b_pp2_vp4_precision_aware_perf_recipe() -> None:
