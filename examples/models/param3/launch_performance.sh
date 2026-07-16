@@ -12,12 +12,13 @@ MCORE=${MCORE:-${BRIDGE}/3rdparty/Megatron-LM}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-}
 LAUNCHER_PYTHON=${LAUNCHER_PYTHON:-${BRIDGE}/.venv-launcher/bin/python}
 
-PARAM3_VARIANT=${PARAM3_VARIANT:-pp2_vp4_precision_aware_perf}
+PARAM3_VARIANT=${PARAM3_VARIANT:-pp2_precision_aware_perf}
 PARAM3_ACCOUNT=${PARAM3_ACCOUNT:-nemotron_n4_pre}
 PARAM3_PARTITION=${PARAM3_PARTITION:-backfill}
 PARAM3_TIME=${PARAM3_TIME:-00:30:00}
 PARAM3_LOG_DIR=${PARAM3_LOG_DIR:-${BRIDGE}/nemo_runs/${PARAM3_VARIANT}}
 PARAM3_EXTRA_MOUNTS=${PARAM3_EXTRA_MOUNTS:-}
+PARAM3_COMPILE_CACHE=${PARAM3_COMPILE_CACHE:-}
 
 case "${PARAM3_VARIANT}" in
     pp2_*) PP_SIZE=2 ;;
@@ -52,6 +53,11 @@ if [[ -n "${PARAM3_EXTRA_MOUNTS}" ]]; then
     MOUNTS+=",${PARAM3_EXTRA_MOUNTS}"
 fi
 
+if [[ -n "${PARAM3_COMPILE_CACHE}" ]]; then
+    mkdir -p "${PARAM3_COMPILE_CACHE}"
+    MOUNTS+=",${PARAM3_COMPILE_CACHE}:${PARAM3_COMPILE_CACHE}"
+fi
+
 ARGS=(
     "${BRIDGE}/scripts/performance/setup_experiment.py"
     --account "${PARAM3_ACCOUNT}"
@@ -79,7 +85,7 @@ ARGS=(
     --tokenizer_type NullTokenizer
     --vocab_size 128008
     --cuda_graph_impl transformer_engine
-    --cuda_graph_scope moe_router,moe_preprocess
+    --cuda_graph_scope attn,moe_router,moe_preprocess
     --moe_flex_dispatcher_backend hybridep
     --wandb_experiment_name "param3_74b_${PARAM3_VARIANT}"
     --log_dir "${PARAM3_LOG_DIR}"
@@ -106,6 +112,10 @@ ARGS=(
 # recompute_granularity=None and recompute_modules=[] survive CLI overrides.
 if [[ "${PARAM3_VARIANT}" != *no_recompute* ]]; then
     ARGS+=(--recompute_modules layernorm,moe_act,mhc)
+fi
+
+if [[ -n "${PARAM3_COMPILE_CACHE}" ]]; then
+    ARGS+=(-E "PERF_COMPILE_CACHE_ROOT=${PARAM3_COMPILE_CACHE}")
 fi
 
 if [[ "${DRYRUN:-0}" == 1 ]]; then
