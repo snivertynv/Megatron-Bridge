@@ -46,22 +46,41 @@ export PYTHONUNBUFFERED=1
 export SLURM_UNBUFFEREDIO=1
 export FORCE_FLASHQLA_GDN=${FORCE_FLASHQLA_GDN:-1}
 export NVTE_CUTEDSL_FUSED_GROUPED_MLP=${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-1}
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NVLS_ENABLE=0
 export NCCL_PXN_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# H100 NVL8 settings used by the Megatron performance launcher for HybridEP.
+# They are inert for recipes that retain the all-to-all dispatcher.
+export NVLINK_DOMAIN_SIZE=${NVLINK_DOMAIN_SIZE:-8}
+export USE_MNNVL=${USE_MNNVL:-0}
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}
+export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-128}
+export NVTE_FWD_LAYERNORM_SM_MARGIN=${NVTE_FWD_LAYERNORM_SM_MARGIN:-20}
+export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN:-20}
 export MEGATRON_BRIDGE_PATH WORKSPACE CHECKPOINT_DIR RECIPE_NAME
+
+if [ -z "${MASTER_ADDR:-}" ]; then
+    MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+    MASTER_ADDR=${MASTER_ADDR%%$'\n'*}
+fi
+if [ -z "${MASTER_ADDR}" ]; then
+    echo "ERROR: failed to resolve MASTER_ADDR from ${SLURM_JOB_NODELIST}." >&2
+    exit 1
+fi
+export MASTER_ADDR
 
 read -r -d '' INNER_SCRIPT <<'EOF' || true
 set -euo pipefail
-export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
 export RANK=${SLURM_PROCID}
 export WORLD_SIZE=${SLURM_NTASKS}
 export LOCAL_RANK=${SLURM_LOCALID}
 
 cd "${MEGATRON_BRIDGE_PATH}"
-uv run --no-sync python scripts/training/run_recipe.py \
+numactl --cpunodebind=$((SLURM_LOCALID / 4)) --membind=$((SLURM_LOCALID / 4)) \
+    uv run --no-sync python scripts/training/run_recipe.py \
     --recipe "${RECIPE_NAME}" \
     --dataset llm-pretrain-mock \
     --step_func gpt_step \
@@ -69,7 +88,9 @@ uv run --no-sync python scripts/training/run_recipe.py \
     checkpoint.load=null
 EOF
 
-SRUN_CMD=(srun --mpi=pmix --kill-on-bad-exit=1 --container-image="${CONTAINER_IMAGE}")
+# Let numactl own CPU affinity.  task/affinity may otherwise pin each task
+# before numactl can bind ranks 0-3 and 4-7 to their respective NUMA nodes.
+SRUN_CMD=(srun --mpi=pmix --cpu-bind=none --kill-on-bad-exit=1 --container-image="${CONTAINER_IMAGE}")
 if [ -n "${CONTAINER_MOUNTS}" ]; then
     SRUN_CMD+=(--container-mounts="${CONTAINER_MOUNTS}")
 fi
@@ -77,4 +98,5 @@ fi
 echo "Launching Param3 74B on ${SLURM_NNODES} nodes / ${SLURM_NTASKS} GPUs"
 echo "Recipe: ${RECIPE_NAME}"
 echo "Run uses mock data, global batch size 64, and random initialization"
+echo "Distributed rendezvous: ${MASTER_ADDR}:${MASTER_PORT}"
 "${SRUN_CMD[@]}" bash -lc "${INNER_SCRIPT}"

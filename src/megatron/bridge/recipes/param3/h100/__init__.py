@@ -15,10 +15,26 @@
 from megatron.bridge.recipes.param3.h100.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_config,
     param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config,
+    param3_74b_pretrain_32gpu_h100_bf16_fsdp_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp2_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp2_no_moe_recompute_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config,
 )
 
 
 __all__ = [
     "param3_74b_pretrain_32gpu_h100_bf16_config",
     "param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_fsdp_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_no_moe_recompute_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config",
 ]
