@@ -35,6 +35,12 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-}
 CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-${WORKSPACE}/results/param3_74b_${SLURM_JOB_ID}/checkpoints}
 RECIPE_NAME=${RECIPE_NAME:-param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config}
+NSYS_ENABLE=${NSYS_ENABLE:-0}
+NSYS_TRACE=${NSYS_TRACE:-cuda}
+NSYS_PROFILE_RANK=${NSYS_PROFILE_RANK:-0}
+NSYS_PROFILE_START_STEP=${NSYS_PROFILE_START_STEP:-10}
+NSYS_PROFILE_STOP_STEP=${NSYS_PROFILE_STOP_STEP:-11}
+NSYS_OUTPUT_DIR=${NSYS_OUTPUT_DIR:-${WORKSPACE}/results/param3_74b_${SLURM_JOB_ID}/nsys}
 
 if [ -z "${CONTAINER_IMAGE}" ]; then
     echo "ERROR: CONTAINER_IMAGE must point to the Param3 mHC container."
@@ -61,6 +67,8 @@ export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API
 export NVTE_FWD_LAYERNORM_SM_MARGIN=${NVTE_FWD_LAYERNORM_SM_MARGIN:-20}
 export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN:-20}
 export MEGATRON_BRIDGE_PATH WORKSPACE CHECKPOINT_DIR RECIPE_NAME
+export NSYS_ENABLE NSYS_TRACE NSYS_PROFILE_RANK NSYS_PROFILE_START_STEP
+export NSYS_PROFILE_STOP_STEP NSYS_OUTPUT_DIR
 
 if [ -z "${MASTER_ADDR:-}" ]; then
     MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}")
@@ -79,13 +87,45 @@ export WORLD_SIZE=${SLURM_NTASKS}
 export LOCAL_RANK=${SLURM_LOCALID}
 
 cd "${MEGATRON_BRIDGE_PATH}"
-numactl --cpunodebind=$((SLURM_LOCALID / 4)) --membind=$((SLURM_LOCALID / 4)) \
-    uv run --no-sync python scripts/training/run_recipe.py \
-    --recipe "${RECIPE_NAME}" \
-    --dataset llm-pretrain-mock \
-    --step_func gpt_step \
-    checkpoint.save="${CHECKPOINT_DIR}" \
+TRAIN_CMD=(
+    uv run --no-sync python scripts/training/run_recipe.py
+    --recipe "${RECIPE_NAME}"
+    --dataset llm-pretrain-mock
+    --step_func gpt_step
+    "checkpoint.save=${CHECKPOINT_DIR}"
     checkpoint.load=null
+)
+
+if [[ "${NSYS_ENABLE}" == 1 ]]; then
+    TRAIN_CMD+=(
+        profiling.use_nsys_profiler=true
+        "profiling.profile_step_start=${NSYS_PROFILE_START_STEP}"
+        "profiling.profile_step_end=${NSYS_PROFILE_STOP_STEP}"
+        "profiling.profile_ranks=[${NSYS_PROFILE_RANK}]"
+        profiling.record_shapes=false
+    )
+fi
+
+NUMA_CMD=(
+    numactl
+    "--cpunodebind=$((SLURM_LOCALID / 4))"
+    "--membind=$((SLURM_LOCALID / 4))"
+)
+
+if [[ "${NSYS_ENABLE}" == 1 && "${SLURM_PROCID}" == "${NSYS_PROFILE_RANK}" ]]; then
+    mkdir -p "${NSYS_OUTPUT_DIR}"
+    "${NUMA_CMD[@]}" nsys profile \
+        "--trace=${NSYS_TRACE}" \
+        --sample=none \
+        --cpuctxsw=none \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end=stop \
+        --force-overwrite=true \
+        "--output=${NSYS_OUTPUT_DIR}/profile_job${SLURM_JOB_ID}_rank${SLURM_PROCID}" \
+        "${TRAIN_CMD[@]}"
+else
+    "${NUMA_CMD[@]}" "${TRAIN_CMD[@]}"
+fi
 EOF
 
 # Let numactl own CPU affinity.  task/affinity may otherwise pin each task
@@ -99,4 +139,8 @@ echo "Launching Param3 74B on ${SLURM_NNODES} nodes / ${SLURM_NTASKS} GPUs"
 echo "Recipe: ${RECIPE_NAME}"
 echo "Run uses mock data, global batch size 64, and random initialization"
 echo "Distributed rendezvous: ${MASTER_ADDR}:${MASTER_PORT}"
+if [[ "${NSYS_ENABLE}" == 1 ]]; then
+    echo "Nsys rank ${NSYS_PROFILE_RANK}: trace=${NSYS_TRACE}, steps=${NSYS_PROFILE_START_STEP}-${NSYS_PROFILE_STOP_STEP}"
+    echo "Nsys output: ${NSYS_OUTPUT_DIR}"
+fi
 "${SRUN_CMD[@]}" bash -lc "${INNER_SCRIPT}"
