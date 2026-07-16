@@ -20,7 +20,9 @@ import torch.nn.functional as F
 from megatron.bridge.models.param3 import Param3ModelProvider
 from megatron.bridge.recipes.common import _pretrain_common
 from megatron.bridge.recipes.utils.optimizer_utils import distributed_fused_adam_with_cosine_annealing_samples
+from megatron.bridge.training.comm_overlap import CommOverlapConfig
 from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.mixed_precision import bf16_mixed
 
 
 PARAM3_74B_ATTENTION_PATTERN = [0, 1, 1] * 13 + [0]
@@ -48,7 +50,6 @@ def param3_74b_pretrain_32gpu_h100_bf16_config() -> ConfigContainer:
         kv_channels=128,
         vocab_size=128008,
         seq_length=4096,
-        max_position_embeddings=4096,
         make_vocab_size_divisible_by=1,
         normalization="RMSNorm",
         activation_func=F.silu,
@@ -112,6 +113,7 @@ def param3_74b_pretrain_32gpu_h100_bf16_config() -> ConfigContainer:
         cuda_graph_impl="none",
         cuda_graph_modules=[],
         kitchen_attention_backend=None,
+        use_fused_mhc=True,
     )
 
     # ``mhc`` is supplied by the Param3 Megatron-Core branch. Assign it after
@@ -132,7 +134,8 @@ def param3_74b_pretrain_32gpu_h100_bf16_config() -> ConfigContainer:
     cfg.tokenizer.tokenizer_model = None
     cfg.tokenizer.vocab_size = 128008
 
-    cfg.train.train_iters = 25
+    cfg.train.train_iters = None
+    cfg.train.train_samples = 1600
     cfg.train.global_batch_size = 64
     cfg.train.micro_batch_size = 1
     cfg.train.manual_gc = True
@@ -153,10 +156,15 @@ def param3_74b_pretrain_32gpu_h100_bf16_config() -> ConfigContainer:
     cfg.scheduler.start_weight_decay = 0.1
     cfg.scheduler.end_weight_decay = 0.1
 
+    cfg.mixed_precision = bf16_mixed()
+    cfg.mixed_precision.grad_reduce_in_fp32 = False
     cfg.ddp.overlap_grad_reduce = True
     cfg.ddp.overlap_param_gather = True
     cfg.ddp.check_for_nan_in_grad = True
-    cfg.ddp.grad_reduce_in_fp32 = True
+    # The local Param3 shard is large enough that an FP32 gradient buffer alone
+    # consumes ~33 GiB and OOMs an 80-GiB H100 during DDP construction.  Reduce
+    # gradients in BF16 so the buffer stays at the model precision (~16.5 GiB).
+    cfg.ddp.grad_reduce_in_fp32 = False
     cfg.ddp.average_in_collective = True
     cfg.ddp.data_parallel_sharding_strategy = "optim_grads"
     cfg.ddp.pad_buckets_for_high_nccl_busbw = True
@@ -195,9 +203,197 @@ def param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config() -> ConfigContainer:
     return cfg
 
 
+def param3_74b_pretrain_32gpu_h100_bf16_fsdp_config() -> ConfigContainer:
+    """Return the BF16 Param3 recipe with fully sharded model state.
+
+    This debug/performance variant keeps the unfused H100 expert path and uses
+    Megatron FSDP to reduce the model-state footprint.  It is intentionally
+    separate from the parity recipe so queued DDP runs remain unchanged.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_config()
+
+    cfg.dist.use_megatron_fsdp = True
+    cfg.ddp.use_megatron_fsdp = True
+    cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+    cfg.ddp.average_in_collective = False
+    # Param3's TransformerBlock does not expose a reset method, so Megatron
+    # FSDP cannot materialize it from meta tensors on this MCore revision.
+    cfg.model.init_model_with_meta_device = False
+    cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+
+    return cfg
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp2_config() -> ConfigContainer:
+    """Return the BF16 Param3 recipe split across two pipeline stages."""
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_config()
+
+    cfg.model.pipeline_model_parallel_size = 2
+
+    return cfg
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_config() -> ConfigContainer:
+    """Return the PP2 recipe with reduced-memory TE FusedAdam state.
+
+    Precision-aware Adam stores BF16 master-weight remainders and BF16 first
+    and second moments.  This reduces the persistent distributed-optimizer
+    footprint without changing the model-parallel topology.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp2_config()
+
+    cfg.optimizer.bf16 = True
+    cfg.optimizer.params_dtype = torch.bfloat16
+    cfg.optimizer.use_precision_aware_optimizer = True
+    cfg.optimizer.store_param_remainders = True
+    cfg.optimizer.main_params_dtype = torch.float32
+    # Gradients are already reduced in BF16 by this recipe.  Avoid materializing
+    # an additional FP32 main-gradient shard solely for the optimizer step.
+    cfg.optimizer.main_grads_dtype = torch.bfloat16
+    cfg.optimizer.exp_avg_dtype = torch.bfloat16
+    cfg.optimizer.exp_avg_sq_dtype = torch.bfloat16
+
+    return cfg
+
+
+def _apply_param3_perf_measurement_overrides(cfg: ConfigContainer) -> None:
+    """Remove training-loop work that is not part of the model step.
+
+    Keep per-iteration throughput logging so short Slurm runs remain directly
+    measurable, but avoid parameter-norm reductions, NaN scans, timing
+    barriers, validation, TensorBoard writes, and checkpoint serialization.
+    """
+    cfg.checkpoint.save = None
+    cfg.validation.eval_iters = 0
+    cfg.train.eval_iters = 0
+
+    cfg.logger.tensorboard_dir = None
+    cfg.logger.log_params_norm = False
+    cfg.logger.log_timers_to_tensorboard = False
+    cfg.logger.barrier_with_L1_time = False
+
+    cfg.ddp.check_for_nan_in_grad = False
+    cfg.ddp.check_for_large_grads = False
+    cfg.rerun_state_machine.check_for_nan_in_loss = False
+    cfg.optimizer.barrier_with_L1_time = False
+
+    # Match the proven Qwen3-MoE H100 performance path: capture the dynamic
+    # router/preprocess launch sequence and use HybridEP's flex dispatcher.
+    cfg.model.cuda_graph_impl = "transformer_engine"
+    cfg.model.cuda_graph_scope = ["moe_router", "moe_preprocess"]
+    cfg.model.moe_token_dispatcher_type = "flex"
+    cfg.model.moe_flex_dispatcher_backend = "hybridep"
+    cfg.model.moe_flex_dispatcher_num_sms = 32
+    cfg.model.moe_a2a_overlap = False
+    cfg.model.moe_shared_expert_overlap = False
+    cfg.rng.te_rng_tracker = True
+    cfg.model.use_te_rng_tracker = True
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config() -> ConfigContainer:
+    """Return the PP2 precision-aware throughput configuration.
+
+    This keeps TP=2, PP=2, EP=8, and ETP=1 from the passing 32-GPU baseline,
+    while removing the full routed-MoE recomputation and benchmark-only work.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_config()
+
+    cfg.model.recompute_modules = ["layernorm", "moe_act", "mhc"]
+    _apply_param3_perf_measurement_overrides(cfg)
+
+    return cfg
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config() -> ConfigContainer:
+    """Return the interleaved PP2 throughput configuration.
+
+    Four virtual chunks put five layers in each chunk and reduce the ideal
+    PP2 pipeline bubble from 1/9 to 1/33 for the eight microbatches used at
+    global batch size 64.  Interleaving also enables optimizer-step parameter
+    gather overlap while preserving EP=8 and ETP=1.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config()
+
+    cfg.model.virtual_pipeline_model_parallel_size = 4
+    # The first iteration performs the expensive kernel/graph warmup.  Twelve
+    # iterations leave ten steady-state samples while fitting a 10-minute
+    # backfill probe; promising results are rerun for the full 25 iterations.
+    cfg.train.train_samples = 12 * cfg.train.global_batch_size
+    # MCore currently disallows optimizer-step parameter-gather overlap when
+    # use_dist_ckpt is true.  This measurement recipe neither loads nor saves a
+    # checkpoint, so select the legacy format solely to clear that runtime flag.
+    cfg.checkpoint.ckpt_format = "torch"
+    cfg.optimizer.overlap_param_gather_with_optimizer_step = True
+    cfg.comm_overlap = CommOverlapConfig(
+        tp_comm_overlap=False,
+        overlap_param_gather_with_optimizer_step=True,
+    )
+
+    return cfg
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config() -> ConfigContainer:
+    """Return a lower-memory PP4 variant of the throughput configuration.
+
+    EP remains eight, so PP4 reduces the local routed-expert parameter and
+    gradient footprint while preserving ETP=1.  On 32 GPUs this topology uses
+    dense DP=4, expert DP=1, and 16 microbatches for global batch size 64.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config()
+
+    cfg.model.pipeline_model_parallel_size = 4
+
+    return cfg
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config() -> ConfigContainer:
+    """Return the interleaved PP4 throughput configuration.
+
+    Two virtual chunks put five layers in each chunk and reduce the pipeline
+    bubble for the 16 microbatches used at global batch size 64.  The virtual
+    chunks also make optimizer-step parameter-gather overlap applicable.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config()
+
+    cfg.model.virtual_pipeline_model_parallel_size = 2
+    # See the PP2/VP4 variant above: no checkpoint I/O is performed, and this
+    # format keeps optimizer-step parameter-gather overlap valid in MCore.
+    cfg.checkpoint.ckpt_format = "torch"
+    cfg.optimizer.overlap_param_gather_with_optimizer_step = True
+    cfg.comm_overlap = CommOverlapConfig(
+        tp_comm_overlap=False,
+        overlap_param_gather_with_optimizer_step=True,
+    )
+
+    return cfg
+
+
+def param3_74b_pretrain_32gpu_h100_bf16_pp2_no_moe_recompute_config() -> ConfigContainer:
+    """Return the PP2 recipe without full routed-MoE recomputation.
+
+    PP2 leaves enough activation headroom on 80-GiB H100s to retain only the
+    fine-grained layernorm, MoE activation, and mHC recomputations.  Avoiding a
+    second full MoE forward in backward is expected to improve throughput while
+    keeping expert tensor parallelism disabled.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp2_config()
+
+    cfg.model.recompute_modules = ["layernorm", "moe_act", "mhc"]
+
+    return cfg
+
+
 __all__ = [
     "PARAM3_74B_ATTENTION_PATTERN",
     "PARAM3_74B_MOE_PATTERN",
     "param3_74b_pretrain_32gpu_h100_bf16_config",
     "param3_74b_pretrain_32gpu_h100_bf16_cutedsl_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_fsdp_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp2_no_moe_recompute_config",
 ]
