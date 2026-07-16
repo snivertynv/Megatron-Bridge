@@ -22,6 +22,7 @@ from megatron.bridge.recipes.param3.h100.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config,
     param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config,
     param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config,
+    param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config,
     param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config,
 )
 
@@ -36,5 +37,6 @@ __all__ = [
     "param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config",
 ]

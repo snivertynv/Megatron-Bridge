@@ -24,6 +24,9 @@ from megatron.bridge.recipes.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config as _pp4_perf_config,
 )
 from megatron.bridge.recipes.param3 import (
+    param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config as _pp4_vp2_no_recompute_perf_config,
+)
+from megatron.bridge.recipes.param3 import (
     param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config as _pp4_vp2_perf_config,
 )
 from megatron.bridge.training.config import ConfigContainer
@@ -49,9 +52,15 @@ def param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config() ->
     return _pp4_vp2_perf_config()
 
 
+def param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config() -> ConfigContainer:
+    """Return the 32-GPU interleaved PP4/VP2 no-recompute probe."""
+    return _pp4_vp2_no_recompute_perf_config()
+
+
 __all__ = [
     "param3_74b_pretrain_32gpu_h100_bf16_pp2_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config",
 ]

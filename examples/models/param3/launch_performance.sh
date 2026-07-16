@@ -81,7 +81,6 @@ ARGS=(
     --cuda_graph_impl transformer_engine
     --cuda_graph_scope moe_router,moe_preprocess
     --moe_flex_dispatcher_backend hybridep
-    --recompute_modules layernorm,moe_act,mhc
     --wandb_experiment_name "param3_74b_${PARAM3_VARIANT}"
     --log_dir "${PARAM3_LOG_DIR}"
     --custom_mounts "${MOUNTS}"
@@ -101,6 +100,13 @@ ARGS=(
     --packager none
     --detach true
 )
+
+# setup_experiment.py only changes recompute when this argument is present.
+# Leave it absent for the PP4/VP2 memory-headroom probe so the recipe's
+# recompute_granularity=None and recompute_modules=[] survive CLI overrides.
+if [[ "${PARAM3_VARIANT}" != *no_recompute* ]]; then
+    ARGS+=(--recompute_modules layernorm,moe_act,mhc)
+fi
 
 if [[ "${DRYRUN:-0}" == 1 ]]; then
     ARGS+=(--dryrun)

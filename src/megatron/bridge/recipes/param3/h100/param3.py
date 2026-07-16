@@ -368,6 +368,22 @@ def param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config() ->
     return cfg
 
 
+def param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config() -> ConfigContainer:
+    """Return the interleaved PP4 recipe without activation recomputation.
+
+    PP4 has the smallest local layer and expert footprint among the Param3
+    performance variants.  This probe spends that memory headroom on retained
+    activations so backward avoids the remaining layernorm, MoE-activation,
+    and mHC recomputation.  ETP remains disabled.
+    """
+    cfg = param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config()
+
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_modules = []
+
+    return cfg
+
+
 def param3_74b_pretrain_32gpu_h100_bf16_pp2_no_moe_recompute_config() -> ConfigContainer:
     """Return the PP2 recipe without full routed-MoE recomputation.
 
@@ -395,5 +411,6 @@ __all__ = [
     "param3_74b_pretrain_32gpu_h100_bf16_pp2_vp4_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp4_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_precision_aware_perf_config",
+    "param3_74b_pretrain_32gpu_h100_bf16_pp4_vp2_no_recompute_precision_aware_perf_config",
     "param3_74b_pretrain_32gpu_h100_bf16_pp2_no_moe_recompute_config",
 ]

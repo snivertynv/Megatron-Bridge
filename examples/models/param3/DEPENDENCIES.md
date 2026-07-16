@@ -159,8 +159,8 @@ CUDA graphs: disabled
 Its warm iterations averaged 4,249.6 ms and 112.78 TFLOP/s/GPU, or 11.40%
 MFU against the 989-TFLOP/s H100 BF16 peak.
 
-The optimized recipes remove full routed-MoE recomputation and non-model
-benchmark work, then enable:
+The default optimized recipes remove full routed-MoE recomputation and
+non-model benchmark work, then enable:
 
 ```text
 Selective recompute: layernorm, moe_act, mhc
@@ -172,6 +172,10 @@ HybridEP SMs:        32
 Precision-aware Adam with BF16 gradients and BF16 moments
 ```
 
+The `pp4_vp2_no_recompute_precision_aware_perf` probe additionally disables
+the remaining selective recomputation. It is intentionally a higher-memory
+throughput experiment and should first be validated with mock data.
+
 Available performance variants:
 
 | Variant | Parallelism | Dense/expert DP | Purpose |
@@ -180,6 +184,7 @@ Available performance variants:
 | `pp2_vp4_precision_aware_perf` | TP2, PP2, VP4, EP8, ETP1 | 8 / 2 | Five layers/chunk; lowest modeled PP2 bubble |
 | `pp4_precision_aware_perf` | TP2, PP4, no VP, EP8, ETP1 | 4 / 1 | Lower per-rank model memory |
 | `pp4_vp2_precision_aware_perf` | TP2, PP4, VP2, EP8, ETP1 | 4 / 1 | Five layers/chunk with interleaving |
+| `pp4_vp2_no_recompute_precision_aware_perf` | TP2, PP4, VP2, EP8, ETP1 | 4 / 1 | Uses PP4 memory headroom to remove all activation recomputation |
 
 The VP recipes use optimizer-step parameter-gather overlap. They perform no
 checkpoint I/O and select `ckpt_format=torch` because MCore does not combine
