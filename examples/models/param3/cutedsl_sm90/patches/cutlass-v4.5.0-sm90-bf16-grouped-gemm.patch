@@ -1,0 +1,610 @@
+diff --git a/examples/python/CuTeDSL/cute/hopper/kernel/grouped_gemm/grouped_gemm.py b/examples/python/CuTeDSL/cute/hopper/kernel/grouped_gemm/grouped_gemm.py
+index a0631be..c504fcf 100644
+--- a/examples/python/CuTeDSL/cute/hopper/kernel/grouped_gemm/grouped_gemm.py
++++ b/examples/python/CuTeDSL/cute/hopper/kernel/grouped_gemm/grouped_gemm.py
+@@ -145,7 +145,7 @@ def _tma_load_ab_nvvm_no_mcast(
+     desc_a_llvm = desc_a.llvm_ptr
+     desc_b_llvm = desc_b.llvm_ptr
+     # TMA A: elect one thread and issue the load with predicate.
+-    is_elected_a = _nvvm_d.elect_sync(_T.bool(), loc=loc, ip=ip)
++    is_elected_a = _nvvm_d.elect_sync(loc=loc, ip=ip)
+     _nvvm_d.CpAsyncBulkTensorGlobalToSharedClusterOp(
+         dstMem=smem_a_llvm,
+         tmaDescriptor=desc_a_llvm,
+@@ -162,7 +162,7 @@ def _tma_load_ab_nvvm_no_mcast(
+         ip=ip,
+     )
+     # TMA B: elect one thread and issue the load with predicate.
+-    is_elected_b = _nvvm_d.elect_sync(_T.bool(), loc=loc, ip=ip)
++    is_elected_b = _nvvm_d.elect_sync(loc=loc, ip=ip)
+     _nvvm_d.CpAsyncBulkTensorGlobalToSharedClusterOp(
+         dstMem=smem_b_llvm,
+         tmaDescriptor=desc_b_llvm,
+@@ -371,7 +371,7 @@ class HopperGroupedGemmPersistentKernel:
+     :type cluster_shape_mn: Tuple[int, int]
+ 
+     :note: Supported A/B data types:
+-        - Float16
++        - Float16/BFloat16
+           A and B must have the same data type
+         - Float8E4M3FN/Float8E5M2
+           A and B can have different types (Float8E4M3FN/Float8E5M2)
+@@ -410,6 +410,7 @@ class HopperGroupedGemmPersistentKernel:
+         swizzle_size: int,
+         raster_along_m: bool,
+         tensormap_update_mode: utils.TensorMapUpdateMode = utils.TensorMapUpdateMode.SMEM,
++        accumulate_c: bool = False,
+     ):
+         """
+         Initializes the configuration for a Hopper dense GEMM kernel.
+@@ -430,6 +431,8 @@ class HopperGroupedGemmPersistentKernel:
+         self.cluster_shape_mn = cluster_shape_mn
+         self.swizzle_size = swizzle_size
+         self.raster_along_m = raster_along_m
++        self.accumulate_c = accumulate_c
++        self.active_num_tensormaps = 4 if accumulate_c else self.num_tensormaps
+         self.mma_inst_shape_mn = None
+         # K dimension is deferred in _setup_attributes
+         self.tile_shape_mnk = (*tile_shape_mn, 1)
+@@ -587,7 +590,7 @@ class HopperGroupedGemmPersistentKernel:
+         problem_shape_mnkl: cute.Tensor,
+         strides_abc: cute.Tensor,
+         tensor_address_abc: cute.Tensor,
+-        total_num_clusters: cutlass.Constexpr[int],
++        total_num_clusters: cute.Tensor,
+         tensormap_cute_tensor: cute.Tensor,
+         max_active_clusters: cutlass.Constexpr[int],
+         stream: cuda.CUstream,
+@@ -601,7 +604,7 @@ class HopperGroupedGemmPersistentKernel:
+         :param problem_shape_mnkl: Device tensor of shape (G, 4) Int32 with (M,N,K,L) per group.
+         :param strides_abc: Device tensor of shape (G, 3, 2) Int32 with strides per group.
+         :param tensor_address_abc: Device tensor of shape (G, 3) Int64 with base ptrs per group.
+-        :param total_num_clusters: Total clusters across all groups (compile-time constant).
++        :param total_num_clusters: Device scalar with the runtime total clusters across groups.
+         :param tensormap_cute_tensor: Tensor map workspace, shape (num_sms, 3, 16) Int64.
+         :param max_active_clusters: Max active clusters (compile-time constant).
+         :param stream: CUDA stream.
+@@ -647,18 +650,23 @@ class HopperGroupedGemmPersistentKernel:
+             self.epi_smem_layout_staged,
+             self.epi_tile,
+         )
+-
+-        tile_sched_params, grid = self._compute_grid(
+-            total_num_clusters,
+-            self.cluster_shape_mn,
+-            max_active_clusters,
++        tma_atom_c_load, _ = self._make_tma_atoms_and_tensors(
++            initial_c,
++            self.epi_smem_layout_staged,
++            self.epi_tile,
++            1,
+         )
+ 
++        # Launch a fixed persistent wave. The scheduler's runtime tile count is
++        # loaded in the device kernel, allowing ragged expert shapes to change
++        # without recompilation.
++        grid = (*self.cluster_shape_mn, max_active_clusters)
++
+         # Number of Int64 words needed for the SMEM tensor map buffer (0 in GMEM mode)
+         self.size_tensormap_in_i64 = (
+             0
+             if self.tensormap_update_mode == utils.TensorMapUpdateMode.GMEM
+-            else HopperGroupedGemmPersistentKernel.num_tensormaps
++            else self.active_num_tensormaps
+             * HopperGroupedGemmPersistentKernel.bytes_per_tensormap
+             // 8
+         )
+@@ -671,6 +679,7 @@ class HopperGroupedGemmPersistentKernel:
+             mainloop_pipeline_array_ptr: cute.struct.MemRange[
+                 cutlass.Int64, self.ab_stage * 2
+             ]
++            c_load_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+             sA: cute.struct.Align[
+                 cute.struct.MemRange[
+                     self.a_dtype, cute.cosize(self.a_smem_layout_staged)
+@@ -701,12 +710,13 @@ class HopperGroupedGemmPersistentKernel:
+             tma_tensor_b,
+             tma_atom_c,
+             tma_tensor_c,
++            tma_atom_c_load,
+             self.tiled_mma,
+             self.cta_layout_mnk,
+             self.a_smem_layout_staged,
+             self.b_smem_layout_staged,
+             self.epi_smem_layout_staged,
+-            tile_sched_params,
++            total_num_clusters,
+             group_count,
+             problem_shape_mnkl,
+             strides_abc,
+@@ -731,12 +741,13 @@ class HopperGroupedGemmPersistentKernel:
+         mB_nkl: cute.Tensor,
+         tma_atom_c: cute.CopyAtom,
+         mC_mnl: cute.Tensor,
++        tma_atom_c_load: cute.CopyAtom,
+         tiled_mma: cute.TiledMma,
+         cta_layout_mnk: cute.Layout,
+         a_smem_layout_staged: cute.ComposedLayout,
+         b_smem_layout_staged: cute.ComposedLayout,
+         epi_smem_layout_staged: cute.ComposedLayout,
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        total_num_clusters: cute.Tensor,
+         group_count: cutlass.Constexpr[int],
+         problem_sizes_mnkl: cute.Tensor,
+         strides_abc: cute.Tensor,
+@@ -768,19 +779,29 @@ class HopperGroupedGemmPersistentKernel:
+         :type b_smem_layout_staged: cute.ComposedLayout
+         :param epi_smem_layout_staged: Shared memory layout for epilogue
+         :type epi_smem_layout_staged: cute.ComposedLayout
+-        :param tile_sched_params: Parameters for the persistent tile scheduler
+-        :type tile_sched_params: utils.PersistentTileSchedulerParams
++        :param total_num_clusters: Device scalar containing the runtime scheduler tile count
++        :type total_num_clusters: cute.Tensor
+         """
+ 
+         tidx, _, _ = cute.arch.thread_idx()
+         warp_idx = cute.arch.warp_idx()
+         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+ 
++        problem_shape_ntile_mnl = (
++            self.cluster_shape_mn[0],
++            self.cluster_shape_mn[1],
++            total_num_clusters[0],
++        )
++        tile_sched_params = utils.PersistentTileSchedulerParams(
++            problem_shape_ntile_mnl, (*self.cluster_shape_mn, 1)
++        )
++
+         # Prefetch Tma desc
+         if warp_idx == 0:
+             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
++            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c_load)
+ 
+         cta_rank_in_cluster = cute.arch.make_warp_uniform(
+             cute.arch.block_idx_in_cluster()
+@@ -808,6 +829,7 @@ class HopperGroupedGemmPersistentKernel:
+ 
+         # mbar arrays
+         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
++        c_load_pipeline_array_ptr = storage.c_load_pipeline_array_ptr.data_ptr()
+ 
+         # Threads/warps participating in this pipeline
+         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
+@@ -831,6 +853,21 @@ class HopperGroupedGemmPersistentKernel:
+             cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
+             defer_sync=True,
+         )
++        c_load_pipeline = pipeline.PipelineTmaAsync.create(
++            barrier_storage=c_load_pipeline_array_ptr,
++            num_stages=1,
++            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
++            consumer_group=pipeline.CooperativeGroup(
++                pipeline.Agent.Thread,
++                self.num_mma_warp_groups * self.num_warps_per_warp_group,
++            ),
++            tx_count=cute.size_in_bytes(
++                self.c_dtype,
++                cute.slice_(epi_smem_layout_staged, (None, None, 0)),
++            ),
++            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
++            defer_sync=True,
++        )
+ 
+         # Cluster arrive after barrier init
+         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+@@ -933,6 +970,9 @@ class HopperGroupedGemmPersistentKernel:
+         tensormap_c_ptr = tensormap_manager.get_tensormap_ptr(
+             tensormaps[(sm_idx, 2, None)].iterator
+         )
++        tensormap_c_load_ptr = tensormap_manager.get_tensormap_ptr(
++            tensormaps[(sm_idx, 3 if self.accumulate_c else 2, None)].iterator
++        )
+ 
+         # SMEM buffer pointers for tensor maps (only non-None in SMEM mode)
+         if cutlass.const_expr(
+@@ -948,10 +988,17 @@ class HopperGroupedGemmPersistentKernel:
+                 smem_tm_base
+                 + 2 * HopperGroupedGemmPersistentKernel.bytes_per_tensormap // 8
+             )
++            tensormap_c_load_smem_ptr = (
++                smem_tm_base
++                + (3 if self.accumulate_c else 2)
++                * HopperGroupedGemmPersistentKernel.bytes_per_tensormap
++                // 8
++            )
+         else:
+             tensormap_a_smem_ptr = None
+             tensormap_b_smem_ptr = None
+             tensormap_c_smem_ptr = None
++            tensormap_c_load_smem_ptr = None
+ 
+         tile_sched_params_for_sched = tile_sched_params
+ 
+@@ -1081,6 +1128,8 @@ class HopperGroupedGemmPersistentKernel:
+                         _ENABLE_NVVM_NON_MCAST_LOAD
+                         and not self.is_a_mcast
+                         and not self.is_b_mcast
++                        and self.a_layout.is_k_major_a()
++                        and self.b_layout.is_k_major_b()
+                     )
+                     mainloop_producer_state.reset_count()
+                     for k_tile in cutlass.range(0, cur_k_tile_cnt, 1, unroll=1):
+@@ -1104,8 +1153,11 @@ class HopperGroupedGemmPersistentKernel:
+                                 ),
+                             )
+                         else:
+-                            # Mcast path: fall back to cute.copy which handles
+-                            # the multicast mask for multi-CTA clusters.
++                            # The standard CuTe path handles multicast and
++                            # non-K-major operands. The custom raw-coordinate
++                            # NVVM load is valid only for its proven K/K layout;
++                            # using it for N-major B generates an illegal SM90
++                            # instruction (validated by jobs 508971-508973).
+                             cute.copy(
+                                 tma_atom_a,
+                                 tAgA_slice[(None, k_tile)],
+@@ -1147,6 +1199,12 @@ class HopperGroupedGemmPersistentKernel:
+             tensormap_manager.init_tensormap_from_atom(
+                 tma_atom_c, tensormap_c_ptr, self.epi_store_warp_id
+             )
++            if cutlass.const_expr(self.accumulate_c):
++                tensormap_manager.init_tensormap_from_atom(
++                    tma_atom_c_load,
++                    tensormap_c_load_ptr,
++                    self.epi_store_warp_id,
++                )
+             # When delegating, MMA warp also initializes A/B and signals DMA warp
+             if cutlass.const_expr(self.delegate_tensormap_ab_init):
+                 tensormap_manager.init_tensormap_from_atom(
+@@ -1176,6 +1234,12 @@ class HopperGroupedGemmPersistentKernel:
+             mainloop_consumer_release_state = pipeline.make_pipeline_state(
+                 pipeline.PipelineUserType.Consumer, self.ab_stage
+             )
++            c_load_producer_state = pipeline.make_pipeline_state(
++                pipeline.PipelineUserType.Producer, 1
++            )
++            c_load_consumer_state = pipeline.make_pipeline_state(
++                pipeline.PipelineUserType.Consumer, 1
++            )
+ 
+             num_k_blocks = cute.size(tCrA, mode=[2])
+ 
+@@ -1215,6 +1279,22 @@ class HopperGroupedGemmPersistentKernel:
+             tRS_rD_layout = cute.make_layout(rD_shape[:3])
+             tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+             tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
++            tRS_rC = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
++            copy_atom_g2r_c = cute.make_copy_atom(
++                cute.nvgpu.warp.LdMatrix8x8x16bOp(
++                    self.c_layout.is_m_major_c(),
++                    4,
++                ),
++                self.c_dtype,
++            )
++            tiled_copy_s2r_c = cute.make_tiled_copy_D(
++                copy_atom_g2r_c, tiled_copy_r2s
++            )
++            thr_copy_s2r_c = tiled_copy_s2r_c.get_slice(
++                tidx - self.num_dma_warp_groups * self.num_threads_per_warp_group
++            )
++            tSR_sC = thr_copy_s2r_c.partition_D(sC)
++            tSR_rC = tiled_copy_s2r_c.retile(tRS_rC)
+             size_tRS_rD = cute.size(tRS_rD)
+ 
+             k_pipe_mmas = 1
+@@ -1238,6 +1318,13 @@ class HopperGroupedGemmPersistentKernel:
+ 
+                 # Per-group tensor map C update (only epi_store warp issues it)
+                 is_group_changed = cur_group_idx != last_group_idx_mma
++                if is_group_changed and last_group_idx_mma != -1:
++                    # The C descriptor is reused for every expert. Drain all
++                    # stores that consumed the previous expert's descriptor
++                    # before mutating it to an independently allocated
++                    # main_grad pointer.
++                    tma_store_pipeline.producer_tail()
++                    self.epilog_sync_barrier.arrive_and_wait()
+                 if is_group_changed and warp_idx == self.epi_store_warp_id:
+                     real_c = self.make_tensor_for_tensormap_update(
+                         cur_group_idx,
+@@ -1251,14 +1338,30 @@ class HopperGroupedGemmPersistentKernel:
+                         ptrs_abc,
+                         2,
+                     )
+-                    tensormap_manager.update_tensormap(
+-                        (real_c,),
+-                        (tma_atom_c,),
+-                        (tensormap_c_ptr,),
+-                        self.epi_store_warp_id,
+-                        (tensormap_c_smem_ptr,),
+-                    )
++                    if cutlass.const_expr(self.accumulate_c):
++                        tensormap_manager.update_tensormap(
++                            (real_c, real_c),
++                            (tma_atom_c, tma_atom_c_load),
++                            (tensormap_c_ptr, tensormap_c_load_ptr),
++                            self.epi_store_warp_id,
++                            (
++                                tensormap_c_smem_ptr,
++                                tensormap_c_load_smem_ptr,
++                            ),
++                        )
++                    else:
++                        tensormap_manager.update_tensormap(
++                            (real_c,),
++                            (tma_atom_c,),
++                            (tensormap_c_ptr,),
++                            self.epi_store_warp_id,
++                            (tensormap_c_smem_ptr,),
++                        )
+                     tensormap_manager.fence_tensormap_update(tensormap_c_ptr)
++                    if cutlass.const_expr(self.accumulate_c):
++                        tensormap_manager.fence_tensormap_update(
++                            tensormap_c_load_ptr
++                        )
+ 
+                 mma_tile_coord_mnl = (
+                     grouped_info.cta_tile_idx_m,
+@@ -1341,6 +1444,13 @@ class HopperGroupedGemmPersistentKernel:
+                     cute.group_modes(sC, 0, 2),
+                     tCgC_for_tma_partition,
+                 )
++                bGS_sC, bGS_gC = cute.nvgpu.cpasync.tma_partition(
++                    tma_atom_c_load,
++                    0,
++                    cute.make_layout(1),
++                    cute.group_modes(sC, 0, 2),
++                    tCgC_for_tma_partition,
++                )
+ 
+                 epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1])
+                 epi_tile_shape = tCgC_for_tma_partition.shape[1]
+@@ -1350,18 +1460,52 @@ class HopperGroupedGemmPersistentKernel:
+ 
+                 num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
+                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
++                    gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
++                    epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
++                        tRS_sD, mode=[3]
++                    )
++
++                    if cutlass.const_expr(self.accumulate_c):
++                        if warp_idx == self.epi_store_warp_id:
++                            c_load_pipeline.producer_acquire(c_load_producer_state)
++                            cute.copy(
++                                tma_atom_c_load,
++                                bGS_gC[(None, gmem_coord)],
++                                bGS_sC[(None, epi_buffer)],
++                                tma_bar_ptr=c_load_pipeline.producer_get_barrier(
++                                    c_load_producer_state
++                                ),
++                                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
++                                    tensormap_c_load_ptr,
++                                    cute.AddressSpace.generic,
++                                ),
++                            )
++                            c_load_pipeline.producer_commit(c_load_producer_state)
++                            c_load_producer_state.advance()
++
++                        c_load_pipeline.consumer_wait(c_load_consumer_state)
++                        cute.copy(
++                            tiled_copy_s2r_c,
++                            tSR_sC[(None, None, None, epi_buffer)],
++                            tSR_rC,
++                        )
++                        c_load_pipeline.consumer_release(c_load_consumer_state)
++                        c_load_consumer_state.advance()
++
+                     # Copy from accumulators to D registers
+                     for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                         tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
+ 
+                     # Type conversion
+                     acc_vec = tRS_rD.load()
++                    if cutlass.const_expr(self.accumulate_c):
++                        # tSR_rC is only the ldmatrix copy view. Read the same
++                        # register storage through its epilogue view so the
++                        # vector profile matches tRS_rD/acc_vec.
++                        acc_vec = acc_vec + tRS_rC.load().to(self.acc_dtype)
+                     tRS_rD_out.store(acc_vec.to(self.c_dtype))
+ 
+                     # Copy from D registers to shared memory
+-                    epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
+-                        tRS_sD, mode=[3]
+-                    )
+                     cute.copy(
+                         tiled_copy_r2s,
+                         tRS_rD_out,
+@@ -1374,7 +1518,6 @@ class HopperGroupedGemmPersistentKernel:
+                     )
+                     self.epilog_sync_barrier.arrive_and_wait()
+ 
+-                    gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                     # Copy from shared memory to global memory (TMA store with updated desc)
+                     if warp_idx == self.epi_store_warp_id:
+                         cute.copy(
+@@ -1766,6 +1909,7 @@ class HopperGroupedGemmPersistentKernel:
+ 
+         valid_ab_dtypes = {
+             cutlass.Float16,
++            cutlass.BFloat16,
+             cutlass.Float8E4M3FN,
+             cutlass.Float8E5M2,
+             cutlass.Uint8,
+@@ -1794,6 +1938,7 @@ class HopperGroupedGemmPersistentKernel:
+         acc_ab_compatibility = {
+             cutlass.Float32: {
+                 cutlass.Float16,
++                cutlass.BFloat16,
+                 cutlass.Float8E4M3FN,
+                 cutlass.Float8E5M2,
+             },
+@@ -1813,6 +1958,7 @@ class HopperGroupedGemmPersistentKernel:
+             cutlass.Float32: {
+                 cutlass.Float32,
+                 cutlass.Float16,
++                cutlass.BFloat16,
+                 cutlass.Float8E4M3FN,
+                 cutlass.Float8E5M2,
+             },
+@@ -2042,6 +2188,7 @@ def run(
+     iterations: int = 1,
+     skip_ref_check: bool = False,
+     use_cold_l2: bool = False,
++    symbolic_initial_layouts: bool = False,
+     **kwargs,
+ ):
+     """Prepare per-group tensors, compile, launch, and validate the Hopper grouped GEMM kernel.
+@@ -2091,13 +2238,14 @@ def run(
+             problem_sizes_mnkl, a_major, b_major, c_major
+         )
+         torch_tensors_abc = []
++        cute_tensors_abc = []
+         torch_fp32_tensors_abc = []
+     else:
+         # Create per-group tensors only when we will execute or validate.
+         (
+             ptrs_abc,
+             torch_tensors_abc,
+-            _,
++            cute_tensors_abc,
+             strides_abc,
+             torch_fp32_tensors_abc,
+         ) = create_tensors_for_all_groups(
+@@ -2113,6 +2261,43 @@ def run(
+         create_tensor_and_stride(1, min_ab_size, min_ab_size, b_major == "n", b_dtype)[2],
+         create_tensor_and_stride(1, min_c_size, min_c_size, c_major == "m", c_dtype)[2],
+     ]
++    runtime_initial_tensors_abc = initial_cute_tensors_abc
++    compile_initial_tensors_abc = initial_cute_tensors_abc
++    if symbolic_initial_layouts:
++        # A fixed-size carrier makes the TMA tensor type itself fixed-size,
++        # which is invalid when descriptors are subsequently updated to a
++        # different expert shape.  A fully dynamic DLPack carrier avoids that
++        # bug but makes non-K-major compilation pathologically expensive.
++        # Symbolic compact tensors retain dynamic dimensions while specializing
++        # only the compact major order, matching the SM100 kernels' separation
++        # of physical layout from runtime ragged extents.
++        from cutlass.cute.runtime import make_fake_compact_tensor
++
++        def symbolic_carrier(dtype, mode0_major):
++            shape = (
++                cute.sym_int32(divisibility=8),
++                cute.sym_int32(divisibility=8),
++                1,
++            )
++            stride_order = (0, 1, 2) if mode0_major else (1, 0, 2)
++            return make_fake_compact_tensor(
++                dtype,
++                shape,
++                stride_order=stride_order,
++                assumed_align=16,
++            )
++
++        compile_initial_tensors_abc = [
++            symbolic_carrier(a_dtype, a_major == "m"),
++            symbolic_carrier(b_dtype, b_major == "n"),
++            symbolic_carrier(c_dtype, c_major == "m"),
++        ]
++        if not compile_only:
++            # Initialize the launch-time TMA atoms from a real problem tensor.
++            # The kernel rewrites their address/shape/stride on group changes,
++            # but an unrelated 8x8 carrier can leave invalid descriptor fields
++            # for non-K-major operands before the first update is published.
++            runtime_initial_tensors_abc = list(cute_tensors_abc[0])
+ 
+     hardware_info = utils.HardwareInfo()
+     sm_count = hardware_info.get_max_active_clusters(1)
+@@ -2178,6 +2363,12 @@ def run(
+     total_num_clusters = compute_total_num_clusters(
+         problem_sizes_mnkl, cluster_tile_shape_mn
+     )
++    total_clusters_cute, total_clusters_torch = cutlass_torch.cute_tensor_like(
++        torch.tensor([total_num_clusters], dtype=torch.int32),
++        cutlass.Int32,
++        is_dynamic_layout=False,
++        assumed_align=16,
++    )
+ 
+     current_stream = cutlass_torch.default_stream()
+ 
+@@ -2187,14 +2378,14 @@ def run(
+         _compiler = cute.compile[cute.KeepPTX()]
+     compiled_grouped_gemm = _compiler(
+         grouped_gemm,
+-        initial_cute_tensors_abc[0],
+-        initial_cute_tensors_abc[1],
+-        initial_cute_tensors_abc[2],
++        compile_initial_tensors_abc[0],
++        compile_initial_tensors_abc[1],
++        compile_initial_tensors_abc[2],
+         num_groups,
+         tensor_of_dim_size_mnkl,
+         tensor_of_strides_abc,
+         tensor_of_ptrs_abc,
+-        total_num_clusters,
++        total_clusters_cute,
+         tensor_of_tensormap,
+         max_active_clusters,
+         current_stream,
+@@ -2202,12 +2393,13 @@ def run(
+ 
+     if not skip_ref_check:
+         compiled_grouped_gemm(
+-            initial_cute_tensors_abc[0],
+-            initial_cute_tensors_abc[1],
+-            initial_cute_tensors_abc[2],
++            runtime_initial_tensors_abc[0],
++            runtime_initial_tensors_abc[1],
++            runtime_initial_tensors_abc[2],
+             tensor_of_dim_size_mnkl,
+             tensor_of_strides_abc,
+             tensor_of_ptrs_abc,
++            total_clusters_cute,
+             tensor_of_tensormap,
+             current_stream,
+         )
+@@ -2236,18 +2428,27 @@ def run(
+         (
+             ptrs_abc_ws,
+             torch_tensors_abc_ws,
+-            _,
++            cute_tensors_abc_ws,
+             strides_abc_ws,
+             __,
+         ) = create_tensors_for_all_groups(
+             problem_sizes_mnkl, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major,
+             torch_fp32_tensors_abc,
+         )
+-        init_ws = [
+-            create_tensor_and_stride(1, min_ab_size, min_ab_size, a_major == "m", a_dtype)[2],
+-            create_tensor_and_stride(1, min_ab_size, min_ab_size, b_major == "n", b_dtype)[2],
+-            create_tensor_and_stride(1, min_c_size, min_c_size, c_major == "m", c_dtype)[2],
+-        ]
++        if symbolic_initial_layouts:
++            init_ws = list(cute_tensors_abc_ws[0])
++        else:
++            init_ws = [
++                create_tensor_and_stride(
++                    1, min_ab_size, min_ab_size, a_major == "m", a_dtype
++                )[2],
++                create_tensor_and_stride(
++                    1, min_ab_size, min_ab_size, b_major == "n", b_dtype
++                )[2],
++                create_tensor_and_stride(
++                    1, min_c_size, min_c_size, c_major == "m", c_dtype
++                )[2],
++            ]
+         strides_ws, _ = cutlass_torch.cute_tensor_like(
+             torch.tensor(strides_abc_ws, dtype=torch.int32),
+             cutlass.Int32, is_dynamic_layout=False, assumed_align=16,
+@@ -2263,7 +2464,7 @@ def run(
+         args = testing.JitArguments(
+             init_ws[0], init_ws[1], init_ws[2],
+             tensor_of_dim_size_mnkl,
+-            strides_ws, ptrs_ws, tensormap_ws,
++            strides_ws, ptrs_ws, total_clusters_cute, tensormap_ws,
+             current_stream,
+         )
+         return args

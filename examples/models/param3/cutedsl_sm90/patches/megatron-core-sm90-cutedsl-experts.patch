@@ -1,0 +1,263 @@
+diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
+index 70ca30ac5..40ac56541 100644
+--- a/megatron/core/transformer/moe/experts.py
++++ b/megatron/core/transformer/moe/experts.py
+@@ -3,6 +3,8 @@ from __future__ import annotations
+ 
+ import inspect
+ import logging
++import os
++import sys
+ from collections.abc import Callable
+ from contextlib import nullcontext
+ from copy import deepcopy
+@@ -78,6 +80,29 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _sm90_cutedsl_pair_env(name: str, default: tuple[int, int]) -> tuple[int, int]:
++    value = os.environ.get(name)
++    if not value:
++        return default
++    parts = value.lower().replace(",", "x").split("x")
++    if len(parts) != 2:
++        raise ValueError(f"{name} must be formatted as MxN, got {value!r}")
++    result = (int(parts[0]), int(parts[1]))
++    if min(result) <= 0:
++        raise ValueError(f"{name} dimensions must be positive, got {value!r}")
++    return result
++
++
++def _sm90_cutedsl_raster_env(name: str, default_along_m: bool) -> bool:
++    value = os.environ.get(name)
++    if not value:
++        return default_along_m
++    value = value.lower()
++    if value not in {"m", "n"}:
++        raise ValueError(f"{name} must be 'm' or 'n', got {value!r}")
++    return value == "m"
++
++
+ class GroupedLinearFc1Interface(Protocol):
+     """Interface for linear_fc1 module in TEGroupedMLP."""
+ 
+@@ -272,6 +297,72 @@ class TEGroupedMLP(MegatronModule):
+             ), "Fused GroupedMLP is not supported for this configuration."
+         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
+         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
++        self._sm90_cutedsl_grouped_fc1 = os.environ.get(
++            "MCORE_SM90_CUTEDSL_GROUPED_FC1", "0"
++        ) == "1"
++        self._sm90_cutedsl_grouped_fc2 = os.environ.get(
++            "MCORE_SM90_CUTEDSL_GROUPED_FC2", "0"
++        ) == "1"
++        self._sm90_cutedsl_grouped_bwd = os.environ.get(
++            "MCORE_SM90_CUTEDSL_GROUPED_BWD", "0"
++        ) == "1"
++        self._sm90_cutedsl_direct_layouts = os.environ.get(
++            "MCORE_SM90_CUTEDSL_DIRECT_LAYOUTS", "0"
++        ) == "1"
++        self._sm90_cutedsl_fc1_runtime = None
++        self._sm90_cutedsl_fc2_runtime = None
++        if self._sm90_cutedsl_grouped_bwd and not (
++            self._sm90_cutedsl_grouped_fc1 or self._sm90_cutedsl_grouped_fc2
++        ):
++            raise ValueError(
++                "MCORE_SM90_CUTEDSL_GROUPED_BWD requires "
++                "MCORE_SM90_CUTEDSL_GROUPED_FC1=1 or "
++                "MCORE_SM90_CUTEDSL_GROUPED_FC2=1"
++            )
++        if self._sm90_cutedsl_direct_layouts and not self._sm90_cutedsl_grouped_bwd:
++            raise ValueError(
++                "MCORE_SM90_CUTEDSL_DIRECT_LAYOUTS requires "
++                "MCORE_SM90_CUTEDSL_GROUPED_BWD=1"
++            )
++        if self._sm90_cutedsl_grouped_fc1 or self._sm90_cutedsl_grouped_fc2:
++            if self._with_fused_impl:
++                raise ValueError(
++                    "SM90 CuTeDSL grouped experts require "
++                    "use_transformer_engine_op_fuser=False"
++                )
++            if self.config.fp8 or self.config.fp4:
++                raise ValueError("SM90 CuTeDSL grouped experts currently support BF16 only")
++            if self.config.add_bias_linear:
++                raise ValueError("SM90 CuTeDSL grouped experts currently require bias-free experts")
++        for name, enabled, linear in (
++            ("FC1", self._sm90_cutedsl_grouped_fc1, self.linear_fc1),
++            ("FC2", self._sm90_cutedsl_grouped_fc2, self.linear_fc2),
++        ):
++            if not enabled:
++                continue
++            if not isinstance(linear, te.pytorch.GroupedLinear):
++                raise TypeError(f"SM90 CuTeDSL grouped {name} requires TE GroupedLinear parameters")
++            if linear.single_grouped_weight:
++                raise ValueError(
++                    f"SM90 CuTeDSL grouped {name} requires per-expert weight tensors"
++                )
++            if linear.delay_wgrad_compute:
++                raise ValueError(
++                    f"SM90 CuTeDSL grouped {name} does not yet support delayed wgrad"
++                )
++            if self._sm90_cutedsl_grouped_bwd:
++                logger.warning(
++                    "Experimental SM90 CuTeDSL grouped %s is enabled; forward, dgrad, and "
++                    "wgrad each use one persistent grouped GEMM launch.",
++                    name,
++                )
++            else:
++                logger.warning(
++                    "Experimental SM90 CuTeDSL grouped %s is enabled; forward uses one "
++                    "persistent grouped GEMM launch, while dgrad and wgrad use "
++                    "correctness-first PyTorch GEMMs.",
++                    name,
++                )
+         if (
+             self.config.gated_linear_unit
+             and self.config.moe_mlp_glu_interleave_size is not None
+@@ -734,9 +825,55 @@ class TEGroupedMLP(MegatronModule):
+             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+         )
+         with expert_fc1_manager as permuted_local_hidden_states:
+-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+-                permuted_local_hidden_states, tokens_per_expert
+-            )
++            if self._sm90_cutedsl_grouped_fc1:
++                adapter_dir = os.environ.get("MCORE_SM90_CUTEDSL_ADAPTER_DIR")
++                if adapter_dir and adapter_dir not in sys.path:
++                    sys.path.insert(0, adapter_dir)
++                from param3_sm90_grouped_linear import (
++                    SM90BF16GroupedLinearRuntime,
++                    sm90_grouped_linear,
++                )
++
++                weights = [
++                    getattr(self.linear_fc1, f"weight{expert}")
++                    for expert in range(self.num_local_experts)
++                ]
++                if self._sm90_cutedsl_fc1_runtime is None:
++                    max_total_tokens = int(
++                        os.environ.get("MCORE_SM90_CUTEDSL_MAX_TOKENS", "32768")
++                    )
++                    self._sm90_cutedsl_fc1_runtime = SM90BF16GroupedLinearRuntime(
++                        self.num_local_experts,
++                        self.linear_fc1.in_features,
++                        self.linear_fc1.out_features,
++                        max_total_tokens=max_total_tokens,
++                        compile_splits=tokens_per_expert,
++                        grouped_backward=self._sm90_cutedsl_grouped_bwd,
++                        direct_backward_layouts=self._sm90_cutedsl_direct_layouts,
++                        cluster_shape_mn=(
++                            (2, 1) if self._sm90_cutedsl_direct_layouts else (1, 1)
++                        ),
++                        raster_along_m=True,
++                    )
++                is_first_microbatch = (
++                    None
++                    if self.linear_fc1.disable_parameter_transpose_cache
++                    else self.linear_fc1.is_first_microbatch
++                )
++                fc1_output = sm90_grouped_linear(
++                    permuted_local_hidden_states,
++                    weights,
++                    tokens_per_expert,
++                    self._sm90_cutedsl_fc1_runtime,
++                    fuse_wgrad_accumulation=self.linear_fc1.fuse_wgrad_accumulation,
++                    is_first_microbatch=is_first_microbatch,
++                )
++                self.linear_fc1.is_first_microbatch = False
++                bias_parallel = None
++            else:
++                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
++                    permuted_local_hidden_states, tokens_per_expert
++                )
+         fc1_output = expert_fc1_manager.group_offload(
+             fc1_output,
+             forced_released_tensors=[permuted_local_hidden_states],
+@@ -830,7 +967,86 @@ class TEGroupedMLP(MegatronModule):
+             with moe_act_manager as fc1_output:
+                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+ 
+-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
++        if self._sm90_cutedsl_grouped_fc2:
++            adapter_dir = os.environ.get("MCORE_SM90_CUTEDSL_ADAPTER_DIR")
++            if adapter_dir and adapter_dir not in sys.path:
++                sys.path.insert(0, adapter_dir)
++            from param3_sm90_grouped_linear import (
++                SM90BF16GroupedLinearRuntime,
++                sm90_grouped_linear,
++            )
++
++            weights = [
++                getattr(self.linear_fc2, f"weight{expert}")
++                for expert in range(self.num_local_experts)
++            ]
++            if self._sm90_cutedsl_fc2_runtime is None:
++                max_total_tokens = int(
++                    os.environ.get("MCORE_SM90_CUTEDSL_MAX_TOKENS", "32768")
++                )
++                self._sm90_cutedsl_fc2_runtime = SM90BF16GroupedLinearRuntime(
++                    self.num_local_experts,
++                    self.linear_fc2.in_features,
++                    self.linear_fc2.out_features,
++                    max_total_tokens=max_total_tokens,
++                    compile_splits=tokens_per_expert,
++                    grouped_backward=self._sm90_cutedsl_grouped_bwd,
++                    direct_backward_layouts=self._sm90_cutedsl_direct_layouts,
++                    tile_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_FORWARD_TILE", (128, 256)
++                    ),
++                    cluster_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_FORWARD_CLUSTER",
++                        (2, 1) if self._sm90_cutedsl_direct_layouts else (1, 1),
++                    ),
++                    raster_along_m=_sm90_cutedsl_raster_env(
++                        "MCORE_SM90_CUTEDSL_FC2_FORWARD_RASTER", True
++                    ),
++                    dgrad_tile_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_DGRAD_TILE", (128, 256)
++                    ),
++                    dgrad_cluster_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_DGRAD_CLUSTER",
++                        (2, 1) if self._sm90_cutedsl_direct_layouts else (1, 1),
++                    ),
++                    dgrad_raster_along_m=_sm90_cutedsl_raster_env(
++                        "MCORE_SM90_CUTEDSL_FC2_DGRAD_RASTER", True
++                    ),
++                    wgrad_tile_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_WGRAD_TILE", (128, 256)
++                    ),
++                    wgrad_cluster_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_WGRAD_CLUSTER",
++                        (2, 1) if self._sm90_cutedsl_direct_layouts else (1, 1),
++                    ),
++                    wgrad_raster_along_m=_sm90_cutedsl_raster_env(
++                        "MCORE_SM90_CUTEDSL_FC2_WGRAD_RASTER",
++                        not self._sm90_cutedsl_direct_layouts,
++                    ),
++                    wgrad_accumulate_tile_shape_mn=_sm90_cutedsl_pair_env(
++                        "MCORE_SM90_CUTEDSL_FC2_WGRAD_ACCUMULATE_TILE",
++                        (128, 256),
++                    ),
++                )
++            is_first_microbatch = (
++                None
++                if self.linear_fc2.disable_parameter_transpose_cache
++                else self.linear_fc2.is_first_microbatch
++            )
++            output = sm90_grouped_linear(
++                bias_act_output,
++                weights,
++                tokens_per_expert,
++                self._sm90_cutedsl_fc2_runtime,
++                fuse_wgrad_accumulation=self.linear_fc2.fuse_wgrad_accumulation,
++                is_first_microbatch=is_first_microbatch,
++            )
++            self.linear_fc2.is_first_microbatch = False
++            output_bias = None
++        else:
++            output, output_bias = apply_module(self.linear_fc2)(
++                bias_act_output, tokens_per_expert
++            )
+         if self.activation_recompute:
+             self.activation_checkpoint.discard_output_and_register_recompute(output)
+ 
