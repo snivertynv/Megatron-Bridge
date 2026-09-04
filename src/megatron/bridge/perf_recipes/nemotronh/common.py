@@ -14,6 +14,7 @@
 # ruff: noqa: F401
 """Common helpers for nemotronh performance recipes."""
 
+import os
 from pathlib import Path
 
 from megatron.core.quantization.utils import load_quantization_recipe
@@ -27,6 +28,22 @@ from megatron.bridge.training.mixed_precision import MixedPrecisionConfig, nemot
 
 
 _TE_QUANT_CFG_PATH = Path(__file__).with_name("te_quant.cfg")
+
+
+def _enable_mamba_true_cp_v3(cfg: ConfigContainer) -> None:
+    """Select the opt-in Mamba True Context Parallel v3 training path."""
+    if os.getenv("SOOFI_ENABLE_MAMBA_TRUE_CP_V3", "0") != "1":
+        return
+
+    from megatron.core.models.mamba.mamba_layer_specs_true_cp_v3 import mamba_stack_spec
+
+    cfg.model.hybrid_stack_spec = mamba_stack_spec
+    cfg.model.mamba_true_cp_chunk_size = int(
+        os.getenv("SOOFI_MAMBA_TRUE_CP_CHUNK_SIZE", "256")
+    )
+    cfg.model.mamba_true_cp_bwd_subsequence_size = int(
+        os.getenv("SOOFI_MAMBA_TRUE_CP_BWD_SUBSEQUENCE_SIZE", "64")
+    )
 
 
 def _with_global_batch_size(cfg: ConfigContainer, global_batch_size: int) -> ConfigContainer:
@@ -44,6 +61,8 @@ def _nemotron_3_super_nvfp4_precision() -> MixedPrecisionConfig:
 
 def _apply_nemotron_3_super_perf_defaults(cfg: ConfigContainer) -> None:
     """Apply shared Nemotron 3 Super perf defaults after recipe-specific overrides."""
+    _enable_mamba_true_cp_v3(cfg)
+
     cfg.mixed_precision.grad_reduce_in_fp32 = False
     cfg.ddp.grad_reduce_in_fp32 = False
 
